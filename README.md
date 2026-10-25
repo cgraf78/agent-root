@@ -204,10 +204,12 @@ from anywhere else, are unchanged. Any failure restores the previous files.
 What this does not do: commands run as full root, so the key is root-equivalent
 for whoever can read it. Protect `keys/` like any root credential, prefer one
 key per host and client so revocation is narrow, and review the journal. The
-log records what was requested; a root command can still erase local logs, so
-forward the journal off the host if you need tamper-evident records. `from`
-patterns are matched by sshd against the client address; keep `UseDNS` off
-(the OpenSSH default) so they never match host names.
+log records what was requested; a root command can still erase local logs, and
+a key holder who floods the journal past its rate limit (`RateLimitBurst`) can
+get entries suppressed while `logger` still reports success. Forward the
+journal off the host if you need tamper-evident records. `from` patterns are
+matched by sshd against the client address; keep `UseDNS` off (the OpenSSH
+default) so they never match host names.
 
 ## Development
 
