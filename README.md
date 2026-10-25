@@ -98,6 +98,20 @@ another machine, set `host` to its name (your `ssh_config`, including
 `ProxyJump`, still applies) and `from` to the address its sshd sees for this
 client.
 
+When the target's sshd cannot see a distinguishing client address, as behind
+NAT where every client arrives from one gateway (WSL2, containers, port
+proxies), reach it through its own loopback instead. Set `host=localhost`,
+`jump` to the target's ordinary SSH login, and `from=127.0.0.1,::1`:
+
+```ini
+host=localhost
+jump=wsl-box
+from=127.0.0.1,::1
+```
+
+The jump uses that account's own keys and `ssh_config`, so the root key works
+only for someone who can already log in to the target as that account.
+
 ## Usage
 
 ```text
@@ -160,6 +174,7 @@ comment line. Unknown keys are errors.
 | --- | --- | --- |
 | `host` | yes | Name or address to connect to. |
 | `port` | no | SSH port, if not the default. |
+| `jump` | no | Host to jump through (`ssh -J`), such as the target's ordinary SSH login. A name or `ssh_config` alias; set its user and port in `ssh_config`. |
 | `from` | yes | Comma-separated source addresses or CIDR ranges allowed to use the key. At least one must be a literal address so enrollment can verify sshd's settings. |
 
 | Variable | Purpose |

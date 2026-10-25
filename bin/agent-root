@@ -102,7 +102,7 @@ load_host() {
   check_name "$name"
   file="$CONFIG_DIR/hosts.d/$name.conf"
   [[ -f "$file" ]] || die "no host config: $file"
-  cfg_host='' cfg_port='' cfg_from=''
+  cfg_host='' cfg_port='' cfg_from='' cfg_jump=''
   while IFS= read -r line || [[ -n "$line" ]]; do
     n=$((n + 1))
     [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
@@ -111,10 +111,15 @@ load_host() {
     value=${line#*=}
     case "$key" in
       host)
-        # No leading dash, so the value can never be read as an ssh option.
-        [[ "$value" =~ ^[A-Za-z0-9._:][A-Za-z0-9._:-]*$ ]] ||
-          die "$file:$n: invalid host: '$value'"
+        valid_host "$value" || die "$file:$n: invalid host: '$value'"
         cfg_host=$value
+        ;;
+      jump)
+        # ssh -J reads a colon as a port separator, so a jump host is a name
+        # or IPv4 address; give an IPv6 jump host an ssh_config alias.
+        valid_host "$value" && [[ "$value" != *:* ]] ||
+          die "$file:$n: invalid jump host: '$value'"
+        cfg_jump=$value
         ;;
       port)
         # No leading zero: Bash arithmetic would read 08 as invalid octal.
@@ -134,6 +139,13 @@ load_host() {
   [[ -n "$cfg_host" ]] || die "$file: missing host="
   [[ -n "$cfg_from" ]] || die "$file: missing from="
   key_file="$CONFIG_DIR/keys/$name"
+}
+
+# A host name, address, or ssh_config alias. No leading dash, so the value can
+# never be read as an ssh option, and no user@, port, or comma list: those
+# belong in ssh_config, which still applies.
+valid_host() {
+  [[ "$1" =~ ^[A-Za-z0-9._:][A-Za-z0-9._:-]*$ ]]
 }
 
 require_key() {
@@ -171,6 +183,13 @@ ssh_args() {
   )
   if [[ -n "$cfg_port" ]]; then
     SSH_ARGS+=(-p "$cfg_port")
+  fi
+  # A jump host makes the target's sshd see the connection from its own
+  # loopback, so from=127.0.0.1,::1 stays meaningful behind NAT (WSL2,
+  # containers, port proxies) where every client shares one gateway address.
+  # The jump login uses the account's ordinary ssh_config and keys.
+  if [[ -n "$cfg_jump" ]]; then
+    SSH_ARGS+=(-J "$cfg_jump")
   fi
   SSH_ARGS+=("$cfg_host")
 }
@@ -229,8 +248,8 @@ cmd_list() {
       load_host "$name"
       key=missing
       [[ -f "$key_file" ]] && key=present
-      printf '%s\thost=%s%s\tfrom=%s\tkey=%s\n' "$name" "$cfg_host" \
-        "${cfg_port:+:$cfg_port}" "$cfg_from" "$key"
+      printf '%s\thost=%s%s%s\tfrom=%s\tkey=%s\n' "$name" "$cfg_host" \
+        "${cfg_port:+:$cfg_port}" "${cfg_jump:+ via $cfg_jump}" "$cfg_from" "$key"
     )
   done
 }
