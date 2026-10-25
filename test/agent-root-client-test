@@ -112,6 +112,12 @@ write_host dashhost host=-oProxyCommand from=127.0.0.1
 run_capture keygen dashhost
 _assert_contains "config: a host that looks like an ssh option fails" "invalid host" "$out"
 
+for bad_jump in -oProxyCommand=x user@jump.example jump.example:22 a,b; do
+  write_host badjump host=localhost from=127.0.0.1 "jump=$bad_jump"
+  run_capture keygen badjump
+  _assert_contains "config: jump '$bad_jump' fails" "invalid jump host" "$out"
+done
+
 write_host noline host=target.example from=127.0.0.1 'just text'
 run_capture keygen noline
 _assert_contains "config: lines without = fail" "expected KEY=VALUE" "$out"
@@ -189,6 +195,17 @@ _assert_not_contains "run: a script sends no remote command" \
 _assert_not_contains "run: a script keeps standard input" \
   $'-n\n' "$(<"$tmp/ssh.args")"
 
+# A jump host goes to ssh as -J, before the target, so the target sees the
+# connection from its own loopback.
+write_host jumped host=localhost jump=gateway.example from=127.0.0.1,::1
+cp "$config/keys/good" "$config/keys/jumped"
+run_capture run jumped -- true
+_assert_exit "jump: run succeeds" 0 "$out_status"
+_assert_contains "jump: passes the jump host to ssh" $'-J\ngateway.example\nlocalhost' \
+  "$(<"$tmp/ssh.args")"
+run_capture run good -- true
+_assert_not_contains "jump: hosts without one send no -J" "-J" "$(<"$tmp/ssh.args")"
+
 # --- check and list ----------------------------------------------------------
 
 cat >"$tmp/fakebin/id" <<'EOF'
@@ -206,12 +223,14 @@ _assert_exit "check: fails when the target is not root" 1 "$out_status"
 _assert_contains "check: reports what came back" "1000" "$out"
 rm -f "$tmp/fakebin/id"
 
-rm -f "$config"/hosts.d/{typo,nohost,nofrom,badport,badfrom,badhost,dashhost,noline}.conf
+rm -f "$config"/hosts.d/{typo,nohost,nofrom,badport,badfrom,badhost,dashhost,badjump,noline}.conf
 write_host nokey host=other.example from=192.0.2.10
 run_capture list
 _assert_exit "list: succeeds" 0 "$out_status"
 _assert_contains "list: shows a host with its key" \
   $'good\thost=target.example:2222\tfrom=127.0.0.1,::1\tkey=present' "$out"
+_assert_contains "list: shows a jump host" \
+  $'jumped\thost=localhost via gateway.example\tfrom=127.0.0.1,::1\tkey=present' "$out"
 _assert_contains "list: shows a host without a key" \
   $'nokey\thost=other.example\tfrom=192.0.2.10\tkey=missing' "$out"
 
