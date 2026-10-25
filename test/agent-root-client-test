@@ -1,0 +1,243 @@
+#!/usr/bin/env bash
+# Client behavior with a fake ssh: argument handling, host config parsing, the
+# pinned ssh options, key management, and status propagation.
+#
+# Several cases pass literal shell text such as '$(id)' on purpose.
+# shellcheck disable=SC2016
+
+set -uo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+
+# shellcheck source=lib/test.sh
+. "$ROOT/test/lib/test.sh"
+
+printf '=== agent-root client ===\n'
+
+agent_root="$ROOT/bin/agent-root"
+tmp=$(_tmpdir)
+config="$tmp/config"
+mkdir -p "$config/hosts.d" "$tmp/fakebin"
+export AGENT_ROOT_CONFIG_DIR="$config"
+
+# The fake ssh records each argument on its own line, then plays the target:
+# with a remote command it runs that string through bash, as sshd and
+# agent-root-exec would; without one it runs standard input as a script.
+cat >"$tmp/fakebin/ssh" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$@" >"$tmp/ssh.args"
+remote=
+while [[ \$# -gt 0 ]]; do
+  if [[ "\$1" == -- ]]; then remote=\$2; break; fi
+  shift
+done
+if [[ -n "\$remote" ]]; then
+  exec bash -c "\$remote"
+fi
+exec bash -s
+EOF
+chmod +x "$tmp/fakebin/ssh"
+PATH="$tmp/fakebin:$PATH"
+
+write_host() {
+  printf '%s\n' "${@:2}" >"$config/hosts.d/$1.conf"
+}
+
+run_capture() {
+  out_status=0
+  out=$("$agent_root" "$@" 2>&1) || out_status=$?
+}
+
+# --- usage -----------------------------------------------------------------
+
+run_capture --help
+_assert_exit "usage: --help succeeds" 0 "$out_status"
+_assert_contains "usage: --help shows the run form" \
+  "agent-root run HOST [--] COMMAND" "$out"
+
+run_capture
+_assert_exit "usage: a missing command is a usage error" 64 "$out_status"
+
+run_capture frobnicate
+_assert_exit "usage: an unknown command is a usage error" 64 "$out_status"
+_assert_contains "usage: unknown commands are named" "frobnicate" "$out"
+
+run_capture run
+_assert_exit "usage: run without a host is a usage error" 64 "$out_status"
+
+run_capture check a b
+_assert_exit "usage: check takes exactly one host" 64 "$out_status"
+
+# --- host names and config -----------------------------------------------
+
+for bad in ../etc .hidden 'a b' 'x/y' ''; do
+  run_capture keygen "$bad"
+  _assert_exit "names: rejects '$bad'" 64 "$out_status"
+done
+
+run_capture keygen ghost
+_assert_exit "config: a missing host file fails" 1 "$out_status"
+_assert_contains "config: a missing host file names the path" \
+  "$config/hosts.d/ghost.conf" "$out"
+
+write_host typo host=target.example from=127.0.0.1 prot=22
+run_capture keygen typo
+_assert_exit "config: unknown keys fail" 1 "$out_status"
+_assert_contains "config: unknown keys are named with their line" \
+  "typo.conf:3: unknown key: 'prot'" "$out"
+
+write_host nohost from=127.0.0.1
+run_capture keygen nohost
+_assert_contains "config: host= is required" "missing host=" "$out"
+
+write_host nofrom host=target.example
+run_capture keygen nofrom
+_assert_contains "config: from= is required" "missing from=" "$out"
+
+for bad_port in 70000 0 08 -1 22x; do
+  write_host badport host=target.example from=127.0.0.1 "port=$bad_port"
+  run_capture keygen badport
+  _assert_contains "config: port '$bad_port' fails" "invalid port" "$out"
+done
+
+write_host badfrom host=target.example 'from=127.0.0.1;touch /tmp/x'
+run_capture keygen badfrom
+_assert_contains "config: shell text in from= fails" "invalid from list" "$out"
+
+write_host badhost 'host=$(id)' from=127.0.0.1
+run_capture keygen badhost
+_assert_contains "config: shell text in host= fails" "invalid host" "$out"
+
+write_host dashhost host=-oProxyCommand from=127.0.0.1
+run_capture keygen dashhost
+_assert_contains "config: a host that looks like an ssh option fails" "invalid host" "$out"
+
+write_host noline host=target.example from=127.0.0.1 'just text'
+run_capture keygen noline
+_assert_contains "config: lines without = fail" "expected KEY=VALUE" "$out"
+
+# Comments and blank lines are allowed; the file is never sourced.
+write_host good '# a comment' '' host=target.example port=2222 from=127.0.0.1,::1
+
+# --- keys ------------------------------------------------------------------
+
+run_capture run good -- true
+_assert_exit "keys: run without a key fails" 1 "$out_status"
+_assert_contains "keys: the error says how to create one" \
+  "agent-root keygen good" "$out"
+
+if command -v ssh-keygen >/dev/null 2>&1; then
+  run_capture keygen good
+  _assert_exit "keygen: succeeds" 0 "$out_status"
+  _assert_file_exists "keygen: writes the private key" "$config/keys/good"
+  _assert_contains "keygen: comments the key with host and client" \
+    "agent-root:good@" "$(<"$config/keys/good.pub")"
+  _assert_eq "keygen: keeps the keys directory private" 700 \
+    "$(stat -c %a "$config/keys" 2>/dev/null || stat -f %Lp "$config/keys")"
+  _assert_eq "keygen: keeps the private key private" 600 \
+    "$(stat -c %a "$config/keys/good" 2>/dev/null || stat -f %Lp "$config/keys/good")"
+  before=$(<"$config/keys/good.pub")
+  run_capture keygen good
+  _assert_exit "keygen: refuses to replace an existing key" 1 "$out_status"
+  _assert_eq "keygen: leaves the existing key alone" "$before" \
+    "$(<"$config/keys/good.pub")"
+elif [[ "${AGENT_ROOT_TEST_REQUIRE_SSH_KEYGEN:-0}" == 1 ]]; then
+  _fail "keygen: ssh-keygen is required but not installed"
+else
+  printf '  SKIP: ssh-keygen is not installed\n'
+  mkdir -p "$config/keys"
+  printf 'fake\n' >"$config/keys/good"
+  printf 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFake agent-root:good@client\n' \
+    >"$config/keys/good.pub"
+fi
+
+# --- run -------------------------------------------------------------------
+
+run_capture run good -- printf '<%s>' 'a b' "it's" '$(id)' ''
+_assert_exit "run: succeeds" 0 "$out_status"
+_assert_eq "run: every argument reaches the target as one word" \
+  "<a b><it's><\$(id)><>" "$out"
+
+args=$(<"$tmp/ssh.args")
+_assert_contains "run: pins the host key file" \
+  "IdentityFile=$config/keys/good" "$args"
+_assert_contains "run: offers only that key" "IdentitiesOnly=yes" "$args"
+_assert_contains "run: ignores ssh agents" "IdentityAgent=none" "$args"
+_assert_contains "run: never shares a multiplexed session" "ControlPath=none" "$args"
+_assert_contains "run: drops forwards from ssh_config" "ClearAllForwardings=yes" "$args"
+_assert_contains "run: never prompts" "BatchMode=yes" "$args"
+_assert_contains "run: ignores a RemoteCommand from ssh_config" "RemoteCommand=none" "$args"
+_assert_contains "run: ignores the system known_hosts" "GlobalKnownHostsFile=/dev/null" "$args"
+_assert_contains "run: keeps its own known_hosts" \
+  "UserKnownHostsFile=$config/known_hosts" "$args"
+_assert_contains "run: logs in as root" $'-l\nroot' "$args"
+_assert_contains "run: uses the configured port" $'-p\n2222' "$args"
+_assert_contains "run: connects to the configured host" "target.example" "$args"
+_assert_contains "run: sends a command no standard input" $'-n\n-T' "$args"
+
+run_capture run good printf ok
+_assert_eq "run: -- is optional" "ok" "$out"
+
+status=0
+"$agent_root" run good -- bash -c 'exit 9' >/dev/null 2>&1 || status=$?
+_assert_exit "run: returns the remote status" 9 "$status"
+
+out=$(printf 'echo from-script\n' | "$agent_root" run good 2>&1)
+_assert_eq "run: runs a script from standard input" "from-script" "$out"
+_assert_not_contains "run: a script sends no remote command" \
+  "--" "$(<"$tmp/ssh.args")"
+_assert_not_contains "run: a script keeps standard input" \
+  $'-n\n' "$(<"$tmp/ssh.args")"
+
+# --- check and list ----------------------------------------------------------
+
+cat >"$tmp/fakebin/id" <<'EOF'
+#!/usr/bin/env bash
+printf '0\n'
+EOF
+chmod +x "$tmp/fakebin/id"
+run_capture check good
+_assert_exit "check: passes when the target runs commands as root" 0 "$out_status"
+_assert_contains "check: reports success" "good ok" "$out"
+
+printf '#!/usr/bin/env bash\nprintf "1000\\n"\n' >"$tmp/fakebin/id"
+run_capture check good
+_assert_exit "check: fails when the target is not root" 1 "$out_status"
+_assert_contains "check: reports what came back" "1000" "$out"
+rm -f "$tmp/fakebin/id"
+
+rm -f "$config"/hosts.d/{typo,nohost,nofrom,badport,badfrom,badhost,dashhost,noline}.conf
+write_host nokey host=other.example from=192.0.2.10
+run_capture list
+_assert_exit "list: succeeds" 0 "$out_status"
+_assert_contains "list: shows a host with its key" \
+  $'good\thost=target.example:2222\tfrom=127.0.0.1,::1\tkey=present' "$out"
+_assert_contains "list: shows a host without a key" \
+  $'nokey\thost=other.example\tfrom=192.0.2.10\tkey=missing' "$out"
+
+empty_status=0
+empty_out=$(AGENT_ROOT_CONFIG_DIR="$tmp/none" "$agent_root" list 2>&1) ||
+  empty_status=$?
+_assert_exit "list: an empty config is not an error" 0 "$empty_status"
+_assert_eq "list: an empty config prints nothing" "" "$empty_out"
+
+# --- config directory --------------------------------------------------------
+
+xdg_out=$(env -u AGENT_ROOT_CONFIG_DIR XDG_CONFIG_HOME="$tmp/xdg" \
+  "$agent_root" keygen ghost 2>&1)
+_assert_contains "config dir: honors an absolute XDG_CONFIG_HOME" \
+  "$tmp/xdg/agent-root/hosts.d/ghost.conf" "$xdg_out"
+rel_out=$(env -u AGENT_ROOT_CONFIG_DIR XDG_CONFIG_HOME=relative HOME="$tmp/home" \
+  "$agent_root" keygen ghost 2>&1)
+_assert_contains "config dir: ignores a relative XDG_CONFIG_HOME" \
+  "$tmp/home/.config/agent-root/hosts.d/ghost.conf" "$rel_out"
+
+# --- installed through a symlink ---------------------------------------------
+
+mkdir -p "$tmp/bin"
+ln -s "$agent_root" "$tmp/bin/agent-root"
+link_out=$("$tmp/bin/agent-root" enroll good 2>&1 | head -2)
+_assert_contains "symlink: finds its private library through the link" \
+  "Generated by agent-root enroll for host good" "$link_out"
+
+_test_summary

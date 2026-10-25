@@ -1,0 +1,147 @@
+#!/bin/bash -p
+# agent-root-exec - forced command for agent-root's restricted root key.
+#
+# sshd runs this for every login with an agent-root key, whatever command the
+# client asked for. It records the request in the system log before running it
+# and records the exit status afterwards, so the journal is a complete audit
+# trail of what agents did as root. Installed by `agent-root enroll`; keep it
+# dependency-free (bash, logger, a SHA-256 tool, and ssh-keygen) because it
+# runs on hosts that do not have agent-root itself installed.
+#
+# Privileged mode (-p) keeps this shell from reading BASH_ENV or importing
+# functions from an environment the client may influence through AcceptEnv.
+
+set -uo pipefail
+
+TAG=agent-root
+# Scripts are logged in full, so larger ones are refused rather than run with
+# part of their content unrecorded. Fixed rather than configurable so the
+# client's environment cannot change it.
+MAX_SCRIPT_BYTES=65536
+# logger and syslog transports cut messages near 1 KiB. Longer text is split
+# into continuation entries, each marked "+", so nothing is silently dropped.
+# journald also rate-limits each unit (10000 entries per 30s by default) and
+# drops the excess while logger still succeeds, so a request must stay far
+# below that: a maximal script, even fully escaped, is a few hundred chunks.
+LOG_CHUNK_BYTES=768
+
+client=${SSH_CLIENT:-}
+client=${client%% *}
+client=${client:-local}
+request=$$
+# Global so the EXIT trap can still see it after run_script returns.
+spool=
+
+# Log one entry, split into chunks the transport keeps whole. Text with
+# control characters (such as a newline in a command) is written in Bash's
+# $'...' quoting so it cannot forge separate journal lines.
+log() {
+  local text="$*" prefix="[$request]"
+  # Byte semantics for the length and substring operations below.
+  local LC_ALL=C
+
+  if [[ "$text" == *[[:cntrl:]]* ]]; then
+    printf -v text '%q' "$text"
+  fi
+  logger -t "$TAG" -p authpriv.notice -- "$prefix ${text:0:LOG_CHUNK_BYTES}" || return 1
+  text=${text:LOG_CHUNK_BYTES}
+  while [[ -n "$text" ]]; do
+    logger -t "$TAG" -p authpriv.notice -- "$prefix + ${text:0:LOG_CHUNK_BYTES}" || return 1
+    text=${text:LOG_CHUNK_BYTES}
+  done
+}
+
+# The audit trail is the point of this wrapper: if a request cannot be logged,
+# refuse to run it rather than run it unrecorded.
+audit() {
+  log "$@" || {
+    printf 'agent-root: cannot write the audit log; refusing to run\n' >&2
+    exit 70
+  }
+}
+
+sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | cut -d' ' -f1
+  else
+    shasum -a 256 "$1" | cut -d' ' -f1
+  fi
+}
+
+# The fingerprint of the key that authenticated this session, from the file
+# sshd writes when the drop-in sets ExposeAuthInfo. It tells requests from
+# different enrolled clients apart; "unknown" if sshd or ssh-keygen cannot say.
+key_id() {
+  local method key fingerprint=
+
+  if [[ -r "${SSH_USER_AUTH:-}" ]] && read -r method key <"$SSH_USER_AUTH" &&
+    [[ "$method" == publickey ]]; then
+    fingerprint=$(printf '%s\n' "$key" | ssh-keygen -lf - 2>/dev/null | cut -d' ' -f2)
+  fi
+  printf '%s\n' "${fingerprint:-unknown}"
+}
+
+source_info="from=$client key=$(key_id)"
+
+# Commands run with a fixed, minimal environment so variables the client may
+# pass through AcceptEnv (BASH_ENV, exported functions, and the like) cannot
+# change what the logged request does.
+clean_env=(env -i)
+# Proxy settings come from the system environment (/etc/environment via PAM),
+# not the client, and package managers need them.
+for var in PATH HOME USER LOGNAME SHELL LANG TZ SSH_CLIENT SSH_CONNECTION \
+  http_proxy https_proxy no_proxy HTTP_PROXY HTTPS_PROXY NO_PROXY; do
+  if [[ -n "${!var+set}" ]]; then
+    clean_env+=("$var=${!var}")
+  fi
+done
+
+# Standard input is closed: content streamed to a command would run or land
+# unrecorded. Send content as a script instead, which is logged in full.
+run_command() {
+  audit "run $source_info: $SSH_ORIGINAL_COMMAND"
+  "${clean_env[@]}" /bin/bash -c "$SSH_ORIGINAL_COMMAND" </dev/null
+}
+
+# Without a command, the client sends a script on standard input. Spool it to a
+# private file first so the logged copy and the executed copy are the same
+# bytes, then run it with standard input closed.
+run_script() {
+  local status bytes digest
+
+  spool=$(mktemp "${TMPDIR:-/tmp}/agent-root.XXXXXXXX") || {
+    log "failed $source_info: cannot create script spool"
+    return 70
+  }
+  # The spool holds the request until it finishes; remove it on any exit.
+  trap 'rm -f -- "$spool"' EXIT
+  cat >"$spool"
+  bytes=$(wc -c <"$spool" | tr -d ' ')
+  digest=$(sha256 "$spool" 2>/dev/null) || digest=
+  [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || {
+    log "failed $source_info: cannot hash the script"
+    printf 'agent-root: no SHA-256 tool for the audit log; refusing to run\n' >&2
+    return 70
+  }
+  if ((bytes > MAX_SCRIPT_BYTES)); then
+    log "refused $source_info: bytes=$bytes sha256=$digest exceeds $MAX_SCRIPT_BYTES"
+    printf 'agent-root: script is %s bytes; the limit is %s\n' "$bytes" "$MAX_SCRIPT_BYTES" >&2
+    return 65
+  fi
+  audit "script $source_info: bytes=$bytes sha256=$digest"
+  # One entry for the whole script, escaped and chunked by log(), so the
+  # entry count stays bounded however many lines the script has.
+  audit "script| $(<"$spool")"
+  "${clean_env[@]}" /bin/bash "$spool" </dev/null
+  status=$?
+  return "$status"
+}
+
+if [[ -n "${SSH_ORIGINAL_COMMAND:-}" ]]; then
+  run_command
+else
+  run_script
+fi
+status=$?
+log "exit status=$status"
+exit "$status"

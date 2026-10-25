@@ -1,0 +1,50 @@
+name: Tests
+
+on:
+  pull_request:
+  push:
+    # main is the only maintained branch. Keep this trigger aligned with the
+    # protected default branch so retired aliases cannot hide CI drift.
+    branches: [main]
+  schedule:
+    # Stagger sibling repositories so scheduled full matrices do not compete
+    # for the same runner capacity at the top of the hour.
+    - cron: "17 9 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shell:
+    uses: cgraf78/actions/.github/workflows/shell-ci.yml@6ecbf5dafaeb9483aeeba3915321544b31572172
+    with:
+      # The client runs wherever agents do (Linux, macOS, Termux), so every PR
+      # gets the full shared matrix. The OpenSSH client profile supplies
+      # ssh-keygen; the real-sshd suite is opt-in because no profile installs
+      # an OpenSSH server.
+      matrix-set: full
+      profiles: base,openssh-netcat-lsof
+      shellcheck-inventory-path: .github/shellcheck-files.txt
+      test-command: AGENT_ROOT_TEST_REQUIRE_SSH_KEYGEN=1 AGENT_ROOT_SKIP_SHELLCHECK=1 test/run
+
+  actions-sync:
+    name: cgraf78/actions sync
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        # Name checkout's throwaway initial branch so Git skips its hint.
+        env:
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: init.defaultBranch
+          GIT_CONFIG_VALUE_0: main
+        with:
+          persist-credentials: false
+
+      # GitHub resolves literal `uses:` refs before a job can read repository
+      # files, so `.github/cgraf78-actions.lock` cannot be interpolated. This gate
+      # verifies every unavoidable cgraf78/actions literal still matches that
+      # single reviewed dependency decision.
+      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@6ecbf5dafaeb9483aeeba3915321544b31572172

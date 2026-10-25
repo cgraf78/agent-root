@@ -1,0 +1,35 @@
+# Managed by agent-root. Remove with `agent-root revoke`, not by hand.
+#
+# Root may log in only from the enrolled source addresses, only with a key
+# listed in agent-root's own authorized_keys file, and only to run the
+# agent-root-exec forced command. Global settings for every other connection
+# are unchanged. Enrollment checks each setting below against `sshd -T`, so
+# every line inside the Match block must be one sshd reports back verbatim.
+Match User root Address @FROM@
+    PermitRootLogin forced-commands-only
+    # A global AllowUsers list would otherwise reject root before key checks.
+    AllowUsers root
+    # Only agent-root's keys, never root's own authorized_keys, a key lookup
+    # command, or a CA certificate, can authenticate this connection.
+    AuthenticationMethods publickey
+    AuthorizedKeysFile /etc/ssh/agent-root/authorized_keys
+    AuthorizedKeysCommand none
+    AuthorizedPrincipalsFile none
+    TrustedUserCAKeys none
+    # sshd itself runs the logging wrapper whatever the key entry's command=
+    # says; forced-commands-only above also refuses an entry without one.
+    ForceCommand /usr/local/sbin/agent-root-exec
+    # Lets the wrapper log which key made each request.
+    ExposeAuthInfo yes
+    # Replaces any global AcceptEnv list, so the client cannot pass variables
+    # such as BASH_ENV, LD_PRELOAD, or TMPDIR to root's shell or the wrapper.
+    AcceptEnv LANG
+    # No tunnels or forwarding of any kind, even where the global config or
+    # a future key option would allow them.
+    PermitTunnel no
+    DisableForwarding yes
+
+# sshd_config.d files are usually included at the top of sshd_config. End the
+# conditional block here so the main file's later global settings do not
+# become part of it.
+Match all

@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+
+# Shared CI owns one required inventory lint; local runs still lint by default.
+# Reading the same typed inventory keeps the two paths from acquiring different
+# ideas of which generated fixtures and executable scripts are production shell.
+if [[ "${AGENT_ROOT_SKIP_SHELLCHECK:-0}" != 1 ]] &&
+  command -v shellcheck >/dev/null 2>&1; then
+  shell_files=()
+  while IFS=$'\t' read -r record_type path ||
+    [[ -n "$record_type$path" ]]; do
+    if [[ "$record_type" == program ]]; then
+      shell_files+=("$ROOT/$path")
+    fi
+  done <"$ROOT/.github/shellcheck-files.txt"
+  ((${#shell_files[@]} > 0)) || {
+    printf 'test/run: ShellCheck inventory has no programs\n' >&2
+    exit 1
+  }
+  (
+    cd "$ROOT"
+    shellcheck -x -P SCRIPTDIR "${shell_files[@]}"
+  )
+fi
+
+# Each suite owns its own temporary tree and fakes, but run them in a fixed
+# order so a failure report reads the same locally and in CI. A new suite must
+# be added here or it never runs.
+for suite in \
+  "$ROOT/test/install-test" \
+  "$ROOT/test/agent-root-client-test" \
+  "$ROOT/test/agent-root-exec-test" \
+  "$ROOT/test/agent-root-target-test" \
+  "$ROOT/test/agent-root-sshd-test"; do
+  "$suite"
+done

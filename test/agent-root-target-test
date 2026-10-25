@@ -1,0 +1,306 @@
+#!/usr/bin/env bash
+# The generated enroll and revoke scripts, run against a relocated target tree
+# (AGENT_ROOT_TARGET_ROOT) with fake sshd and systemctl: installed files and
+# modes, idempotence, preserved unrelated keys, and rollback on every failure.
+
+set -uo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+
+# shellcheck source=lib/test.sh
+. "$ROOT/test/lib/test.sh"
+
+printf '=== agent-root enroll and revoke ===\n'
+
+agent_root="$ROOT/bin/agent-root"
+tmp=$(_tmpdir)
+config="$tmp/config"
+mkdir -p "$config/hosts.d" "$config/keys" "$tmp/fakebin"
+export AGENT_ROOT_CONFIG_DIR="$config"
+
+key_one='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOne agent-root:box@client1'
+key_two='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITwo agent-root:box2@client2'
+unrelated='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOther admin@laptop'
+printf 'host=localhost\nfrom=127.0.0.1,::1\n' >"$config/hosts.d/box.conf"
+printf 'host=localhost\nfrom=127.0.0.1\n' >"$config/hosts.d/box2.conf"
+printf '%s\n' "$key_one" >"$config/keys/box.pub"
+printf '%s\n' "$key_two" >"$config/keys/box2.pub"
+: >"$config/keys/box"
+: >"$config/keys/box2"
+
+# The fake sshd models only what enroll inspects. -T prints keywords in
+# OpenSSH 10's configuration spelling to exercise the lowercase normalization.
+# Root from an address on the drop-in's Match line gets the drop-in's settings,
+# as sshd would; everyone else gets a baseline that differs in each of them.
+# FAKE_SSHD_LEAK simulates a drop-in that changes other users' settings,
+# FAKE_SSHD_SHADOW one that an earlier rule overrides entirely, and
+# FAKE_SSHD_FORCE an earlier ForceCommand that wins over the drop-in's.
+cat >"$tmp/fakebin/sshd" <<'EOF'
+#!/usr/bin/env bash
+dropin="$AGENT_ROOT_TARGET_ROOT/etc/ssh/sshd_config.d/50-agent-root.conf"
+case "$1" in
+  -t)
+    [[ -z "${FAKE_SSHD_T_ERROR:-}" ]] || { printf '%s\n' "$FAKE_SSHD_T_ERROR" >&2; exit 255; }
+    exit 0
+    ;;
+  -T)
+    spec=$3 user= addr=
+    IFS=, read -r -a parts <<<"$spec"
+    for part in "${parts[@]}"; do
+      case "$part" in
+        user=*) user=${part#user=} ;;
+        addr=*) addr=${part#addr=} ;;
+      esac
+    done
+    printf 'Port 22\n'
+    matched=0
+    if [[ -f "$dropin" && "$user" == root && -z "${FAKE_SSHD_SHADOW:-}" ]]; then
+      list=$(sed -n 's/^Match User root Address //p' "$dropin")
+      [[ ",$list," == *",$addr,"* ]] && matched=1
+    fi
+    if ((matched)); then
+      settings=$(awk '/^Match User/{ m = 1; next } /^Match all/{ m = 0 }
+        m && $1 !~ /^#/ && NF { $1 = $1; print }' "$dropin")
+      if [[ -n "${FAKE_SSHD_FORCE:-}" ]]; then
+        settings=$(sed 's|^ForceCommand .*|ForceCommand /bin/other|' <<<"$settings")
+      fi
+      printf '%s\n' "$settings"
+    else
+      printf '%s\n' 'PermitRootLogin no' 'AllowUsers alice bob' \
+        'AuthenticationMethods any' 'AuthorizedKeysFile .ssh/authorized_keys' \
+        'AuthorizedKeysCommand /usr/bin/userdbctl ssh-authorized-keys %u' \
+        'AuthorizedPrincipalsFile /etc/ssh/auth_principals/%u' \
+        'TrustedUserCAKeys /etc/ssh/user_ca.pub' 'ForceCommand none' \
+        'ExposeAuthInfo no'
+    fi
+    if [[ -f "$dropin" && -n "${FAKE_SSHD_LEAK:-}" ]]; then
+      printf 'MaxSessions 3\n'
+    else
+      printf 'MaxSessions 10\n'
+    fi
+    ;;
+esac
+EOF
+cat >"$tmp/fakebin/systemctl" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >>"$tmp/systemctl.log"
+case "\$1" in
+  is-active) [[ "\${*: -1}" == "\${FAKE_ACTIVE_UNIT:-sshd.service}" ]] ;;
+  reload) exit "\${FAKE_RELOAD_STATUS:-0}" ;;
+esac
+EOF
+chmod +x "$tmp/fakebin/sshd" "$tmp/fakebin/systemctl"
+
+target="$tmp/target"
+root_auth="$target/root/.ssh/authorized_keys"
+auth="$target/etc/ssh/agent-root/authorized_keys"
+dropin="$target/etc/ssh/sshd_config.d/50-agent-root.conf"
+wrapper="$target/usr/local/sbin/agent-root-exec"
+
+reset_target() {
+  rm -rf -- "$target" "$tmp/systemctl.log"
+  mkdir -p "$target/etc/ssh/sshd_config.d" "$target/root/.ssh"
+  printf '# Include drop-in configurations\nInclude /etc/ssh/sshd_config.d/*.conf\n' \
+    >"$target/etc/ssh/sshd_config"
+  printf '%s\n' "$unrelated" >"$root_auth"
+  chmod 0600 "$root_auth"
+  printf 'ssh-ed25519 AAAAHostKey root@box\n' >"$target/etc/ssh/ssh_host_ed25519_key.pub"
+}
+
+# Run a generated script the way an operator would: save it, then run it with
+# bash, here pointed at the relocated tree and the fakes.
+target_run() {
+  local action="$1" host="$2" script="$tmp/$1-$2.sh"
+  shift 2
+
+  "$agent_root" "$action" "$host" >"$script" || return 1
+  out_status=0
+  out=$(env AGENT_ROOT_TARGET_ROOT="$target" \
+    AGENT_ROOT_SSHD="$tmp/fakebin/sshd" \
+    AGENT_ROOT_SYSTEMCTL="$tmp/fakebin/systemctl" \
+    "$@" bash "$script" 2>&1) || out_status=$?
+}
+
+_assert_absent() {
+  local description="$1" file
+  shift
+  for file in "$@"; do
+    if [[ -e "$file" || -L "$file" ]]; then
+      _fail "$description (still present: $file)"
+      return
+    fi
+  done
+  _pass "$description"
+}
+
+mode() {
+  stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"
+}
+
+# --- the generated script -------------------------------------------------
+
+"$agent_root" enroll box >"$tmp/enroll-box.sh"
+script=$(<"$tmp/enroll-box.sh")
+_assert_contains "script: says what generated it" \
+  "Generated by agent-root enroll for host box" "$script"
+_assert_contains "script: tells the operator to review it" "Review it" "$script"
+_assert_contains "script: embeds the public key" "AAAAC3NzaC1lZDI1NTE5AAAAIOne" "$script"
+syntax_status=0
+bash -n "$tmp/enroll-box.sh" || syntax_status=$?
+_assert_exit "script: is valid bash" 0 "$syntax_status"
+
+printf 'host=localhost\nfrom=10.0.0.0/8\n' >"$config/hosts.d/cidr.conf"
+printf '%s\n' "$key_one" >"$config/keys/cidr.pub"
+cidr_status=0
+cidr_out=$("$agent_root" enroll cidr 2>&1) || cidr_status=$?
+_assert_exit "script: enroll needs one literal address to verify" 1 "$cidr_status"
+_assert_contains "script: the refusal says why" "literal address" "$cidr_out"
+
+printf 'not a key\n' >"$config/keys/cidr.pub"
+printf 'host=localhost\nfrom=127.0.0.1\n' >"$config/hosts.d/cidr.conf"
+bad_status=0
+"$agent_root" enroll cidr >/dev/null 2>&1 || bad_status=$?
+_assert_exit "script: refuses a malformed public key" 1 "$bad_status"
+
+# --- enroll ----------------------------------------------------------------
+
+if [[ "$(id -u)" != 0 ]]; then
+  reset_target
+  "$agent_root" enroll box >"$tmp/enroll-box.sh"
+  root_status=0
+  root_out=$(bash "$tmp/enroll-box.sh" 2>&1) || root_status=$?
+  _assert_exit "enroll: refuses to run without root" 1 "$root_status"
+  _assert_contains "enroll: says it needs root" "run this script as root" "$root_out"
+fi
+
+reset_target
+printf 'Port 22\n' >"$target/etc/ssh/sshd_config"
+target_run enroll box
+_assert_exit "enroll: refuses a config without the drop-in Include" 1 "$out_status"
+_assert_contains "enroll: names the missing Include" "does not include sshd_config.d" "$out"
+_assert_absent "enroll: changes nothing without the Include" "$dropin" "$wrapper"
+
+reset_target
+target_run enroll box
+_assert_exit "enroll: succeeds" 0 "$out_status"
+_assert_contains "enroll: reports what it allowed" \
+  "root login allowed only from 127.0.0.1,::1" "$out"
+_assert_eq "enroll: installs the wrapper unchanged" \
+  "$(<"$ROOT/lib/agent-root/agent-root-exec")" "$(<"$wrapper")"
+_assert_eq "enroll: makes the wrapper executable" 755 "$(mode "$wrapper")"
+_assert_contains "enroll: restricts root to the enrolled sources" \
+  "Match User root Address 127.0.0.1,::1" "$(<"$dropin")"
+_assert_contains "enroll: closes the Match block" "Match all" "$(<"$dropin")"
+_assert_contains "enroll: forces the wrapper in sshd as well" \
+  "ForceCommand /usr/local/sbin/agent-root-exec" "$(<"$dropin")"
+_assert_contains "enroll: points root at agent-root's key file" \
+  "AuthorizedKeysFile /etc/ssh/agent-root/authorized_keys" "$(<"$dropin")"
+_assert_eq "enroll: writes exactly the restricted key entry" \
+  'from="127.0.0.1,::1",restrict,command="/usr/local/sbin/agent-root-exec" '"$key_one" \
+  "$(<"$auth")"
+_assert_eq "enroll: keeps the key file private" 600 "$(mode "$auth")"
+_assert_eq "enroll: leaves root's own authorized_keys alone" "$unrelated" "$(<"$root_auth")"
+_assert_contains "enroll: prints the host key for pinning" \
+  "agent-root-box ssh-ed25519 AAAAHostKey" "$out"
+_assert_contains "enroll: reloads the running sshd" "reload sshd.service" \
+  "$(<"$tmp/systemctl.log")"
+
+target_run enroll box
+_assert_exit "enroll: rerunning succeeds" 0 "$out_status"
+_assert_eq "enroll: rerunning keeps one entry per key" 1 \
+  "$(grep -c 'AAAAIOne' "$auth")"
+
+reset_target
+(umask 002 && target_run enroll box && exit "$out_status")
+_assert_eq "enroll: creates the key directory 0755 under any umask" 755 \
+  "$(mode "$(dirname "$auth")")"
+
+target_run enroll box2
+_assert_eq "enroll: a second client adds its own entry" 1 \
+  "$(grep -c 'AAAAITwo' "$auth")"
+_assert_eq "enroll: the first client's entry remains" 1 \
+  "$(grep -c 'AAAAIOne' "$auth")"
+
+target_run enroll box FAKE_ACTIVE_UNIT=ssh.service
+_assert_contains "enroll: reloads Debian's ssh.service" "reload ssh.service" \
+  "$(<"$tmp/systemctl.log")"
+
+target_run enroll box FAKE_ACTIVE_UNIT=none.service
+_assert_exit "enroll: succeeds without a running sshd service" 0 "$out_status"
+_assert_contains "enroll: explains why nothing was reloaded" \
+  "no running sshd service" "$out"
+
+# A pattern in from= is enforced by sshd but never probed, and must not be
+# glob-expanded into a literal address from whatever directory enroll runs in.
+printf 'host=localhost\nfrom=127.0.0.1,10.0.0.*\n' >"$config/hosts.d/pattern.conf"
+printf '%s\n' "$key_one" >"$config/keys/pattern.pub"
+reset_target
+mkdir -p "$tmp/globdir"
+: >"$tmp/globdir/10.0.0.5"
+(cd "$tmp/globdir" && target_run enroll pattern && exit "$out_status")
+_assert_exit "enroll: a pattern in from= is not glob-expanded" 0 $?
+
+# --- rollback ----------------------------------------------------------------
+
+check_rollback() {
+  local label="$1" expected="$2"
+
+  _assert_exit "rollback ($label): fails" 1 "$out_status"
+  _assert_contains "rollback ($label): explains the failure" "$expected" "$out"
+  _assert_contains "rollback ($label): reports the restore" "restored the previous files" "$out"
+  _assert_eq "rollback ($label): leaves root's authorized_keys" "$unrelated" "$(<"$root_auth")"
+  _assert_absent "rollback ($label): removes the new files" "$dropin" "$wrapper" "$auth"
+  _assert_absent "rollback ($label): removes the directories it created" \
+    "$target/usr" "$target/etc/ssh/agent-root"
+  _assert_eq "rollback ($label): leaves no temporary files" "" \
+    "$(find "$target" -name '.agent-root.*')"
+}
+
+reset_target
+target_run enroll box FAKE_SSHD_T_ERROR='line 3: Bad configuration option'
+check_rollback "sshd -t" "sshd rejected the configuration"
+
+reset_target
+target_run enroll box FAKE_SSHD_LEAK=1
+check_rollback "leak" "settings for other users changed"
+
+reset_target
+target_run enroll box FAKE_SSHD_SHADOW=1
+check_rollback "shadowed" "does not get 'permitrootlogin forced-commands-only'"
+
+reset_target
+target_run enroll box FAKE_SSHD_FORCE=1
+check_rollback "forcecommand" "does not get 'forcecommand /usr/local/sbin/agent-root-exec'"
+
+reset_target
+target_run enroll box FAKE_RELOAD_STATUS=1
+check_rollback "reload" ""
+
+# --- revoke ------------------------------------------------------------------
+
+reset_target
+target_run enroll box
+target_run enroll box2
+target_run revoke box2
+_assert_exit "revoke: succeeds" 0 "$out_status"
+_assert_contains "revoke: says other keys remain" "other agent-root keys remain" "$out"
+_assert_eq "revoke: removes only that key" 0 "$(grep -c 'AAAAITwo' "$auth")"
+_assert_eq "revoke: keeps other agent-root keys" 1 "$(grep -c 'AAAAIOne' "$auth")"
+_assert_file_exists "revoke: keeps the drop-in while keys remain" "$dropin"
+_assert_file_exists "revoke: keeps the wrapper while keys remain" "$wrapper"
+
+target_run revoke box
+_assert_exit "revoke: the last key succeeds" 0 "$out_status"
+_assert_contains "revoke: says it removed everything" "removed the last key" "$out"
+_assert_eq "revoke: leaves root's own keys" "$unrelated" "$(<"$root_auth")"
+_assert_absent "revoke: removes the drop-in, wrapper, and key file with the last key" \
+  "$dropin" "$wrapper" "$auth" "$(dirname "$auth")"
+
+reset_target
+target_run enroll box
+target_run revoke box FAKE_SSHD_T_ERROR='broken'
+_assert_exit "revoke: fails when sshd rejects the result" 1 "$out_status"
+_assert_eq "revoke: restores the key on failure" 1 "$(grep -c 'AAAAIOne' "$auth")"
+_assert_file_exists "revoke: restores the drop-in on failure" "$dropin"
+
+_test_summary

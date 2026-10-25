@@ -1,0 +1,189 @@
+#!/usr/bin/env bash
+# The target-side forced command: what it runs, what it logs, and the status
+# it returns, with a fake logger capturing the audit trail.
+#
+# Several requests pass literal shell text such as '$PATH' on purpose.
+# shellcheck disable=SC2016
+
+set -uo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+
+# shellcheck source=lib/test.sh
+. "$ROOT/test/lib/test.sh"
+
+printf '=== agent-root-exec ===\n'
+
+wrapper="$ROOT/lib/agent-root/agent-root-exec"
+tmp=$(_tmpdir)
+mkdir -p "$tmp/fakebin" "$tmp/spool"
+audit="$tmp/audit.log"
+
+cat >"$tmp/fakebin/logger" <<LOGGER
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >>"$audit"
+LOGGER
+chmod +x "$tmp/fakebin/logger"
+
+# Run the wrapper as sshd would: a fresh audit log, the client address in
+# SSH_CLIENT, and the requested command (if any) in SSH_ORIGINAL_COMMAND.
+exec_run() {
+  : >"$audit"
+  out_status=0
+  out=$(env PATH="$tmp/fakebin:$PATH" TMPDIR="$tmp/spool" \
+    SSH_CLIENT="192.0.2.7 50000 22" "$@" "$wrapper" 2>&1) || out_status=$?
+  log=$(<"$audit")
+}
+
+exec_run SSH_ORIGINAL_COMMAND='echo hello; exit 3'
+_assert_eq "command: runs the requested command" "hello" "$out"
+_assert_exit "command: returns its status" 3 "$out_status"
+_assert_contains "command: logs the command with its source" \
+  "run from=192.0.2.7 key=unknown: echo hello; exit 3" "$log"
+_assert_contains "command: logs the exit status" "exit status=3" "$log"
+_assert_contains "command: tags entries for journalctl -t" "-t agent-root" "$log"
+_assert_contains "command: logs to the authpriv facility" "-p authpriv.notice" "$log"
+
+# The script reads from standard input; the wrapper must close it so the
+# script cannot consume or wait on the client's stream.
+: >"$audit"
+script_text='echo one
+read -r x && echo "stdin:$x"
+echo two'
+out=$(printf '%s\n' "$script_text" |
+  env PATH="$tmp/fakebin:$PATH" TMPDIR="$tmp/spool" SSH_CLIENT="192.0.2.7 1 22" \
+    "$wrapper" 2>&1)
+log=$(<"$audit")
+_assert_eq "script: runs with standard input closed" $'one\ntwo' "$out"
+_assert_contains "script: logs size with its source" \
+  "script from=192.0.2.7 key=unknown: bytes=" "$log"
+if [[ "$log" =~ sha256=[0-9a-f]{64} ]]; then
+  _pass "script: logs a SHA-256 digest"
+else
+  _fail "script: logs a SHA-256 digest (got: $log)"
+fi
+_assert_contains "script: logs its content" 'read -r x && echo "stdin:$x"' "$log"
+_assert_eq "script: removes its spool" "" "$(ls -A "$tmp/spool")"
+
+# A script is logged as one escaped entry, so a script of many lines cannot
+# push past journald's rate limit and have its payload dropped.
+: >"$audit"
+out=$({
+  for _ in $(seq 20000); do printf '\n'; done
+  printf 'echo payload\n'
+} | env PATH="$tmp/fakebin:$PATH" TMPDIR="$tmp/spool" "$wrapper" 2>&1)
+_assert_eq "script: a many-line script runs" "payload" "$out"
+_assert_contains "script: its payload is logged" "echo payload" "$(<"$audit")"
+entries=$(grep -c '' "$audit")
+if ((entries < 100)); then
+  _pass "script: many lines make few entries ($entries)"
+else
+  _fail "script: many lines make few entries (got $entries)"
+fi
+
+# Scripts over the cap are refused, never run with part of them unlogged.
+: >"$audit"
+big_status=0
+big_out=$({
+  printf '# %065536d\n' 0
+  printf 'echo ran\n'
+} | env PATH="$tmp/fakebin:$PATH" TMPDIR="$tmp/spool" "$wrapper" 2>&1) ||
+  big_status=$?
+_assert_exit "script: one over the cap is refused" 65 "$big_status"
+_assert_not_contains "script: the refused script does not run" "ran" "$big_out"
+_assert_contains "script: the refusal is logged with the digest" \
+  "exceeds 65536" "$(<"$audit")"
+
+# Content streamed to a command would run unlogged, so stdin is closed.
+: >"$audit"
+stdin_out=$(printf 'echo smuggled\n' | env PATH="$tmp/fakebin:$PATH" \
+  TMPDIR="$tmp/spool" SSH_ORIGINAL_COMMAND=bash "$wrapper" 2>&1)
+_assert_eq "command: standard input is closed" "" "$stdin_out"
+
+# Transports cut messages near 1 KiB, so long text is split, not truncated.
+long=$(printf 'x%.0s' $(seq 2000))
+exec_run SSH_ORIGINAL_COMMAND="true $long"
+_assert_eq "chunks: a long command is split across entries" 3 \
+  "$(grep -vc 'exit status=' "$audit")"
+_assert_eq "chunks: no entry exceeds the chunk size" "" \
+  "$(awk 'length($0) > 768 + 64' "$audit")"
+_assert_eq "chunks: continuations are marked" 2 "$(grep -c '\] + x' "$audit" || true)"
+joined=$(sed -e 's/^.*-- \[[0-9]*\] //' -e 's/^+ //' "$audit" | head -3 | tr -d '\n')
+_assert_contains "chunks: the pieces rejoin to the full command" "true $long" "$joined"
+
+# A newline in a command must not let it write a fake journal line.
+exec_run SSH_ORIGINAL_COMMAND=$'true\n[999] exit status=0'
+_assert_eq "escape: the command stays one entry" 2 "$(grep -c '' "$audit")"
+_assert_contains "escape: control characters are quoted" \
+  "\$'run from=192.0.2.7 key=unknown: true\\n[999] exit status=0'" "$log"
+
+# Variables the client might pass through AcceptEnv must not reach the
+# command's shell.
+cat >"$tmp/bash_env" <<'EOF'
+echo SOURCED
+EOF
+exec_run BASH_ENV="$tmp/bash_env" ENV="$tmp/bash_env" SHELLOPTS=xtrace \
+  'BASH_FUNC_true%%=() { echo HIJACKED; }' SSH_ORIGINAL_COMMAND='true; echo ok'
+_assert_eq "env: BASH_ENV, SHELLOPTS, and exported functions are ignored" "ok" "$out"
+exec_run CLIENT_VAR=1 SSH_ORIGINAL_COMMAND='printf "%s" "${CLIENT_VAR-unset}"'
+_assert_eq "env: other client variables are dropped" "unset" "$out"
+exec_run SSH_ORIGINAL_COMMAND='printf "%s" "$PATH"'
+_assert_contains "env: PATH is kept" "$tmp/fakebin" "$out"
+
+# sshd's ExposeAuthInfo file names the key; the log carries its fingerprint.
+if command -v ssh-keygen >/dev/null 2>&1; then
+  ssh-keygen -q -t ed25519 -N '' -C test -f "$tmp/client_key"
+  printf 'publickey %s\n' "$(cut -d' ' -f1,2 "$tmp/client_key.pub")" >"$tmp/user_auth"
+  fingerprint=$(ssh-keygen -lf "$tmp/client_key.pub" | cut -d' ' -f2)
+  exec_run SSH_USER_AUTH="$tmp/user_auth" SSH_ORIGINAL_COMMAND=true
+  _assert_contains "key: logs the authenticating key's fingerprint" \
+    "run from=192.0.2.7 key=$fingerprint: true" "$log"
+elif [[ "${AGENT_ROOT_TEST_REQUIRE_SSH_KEYGEN:-0}" == 1 ]]; then
+  _fail "key: ssh-keygen is required but not installed"
+else
+  printf '  SKIP: ssh-keygen is not installed\n'
+fi
+printf 'password\n' >"$tmp/user_auth_pw"
+exec_run SSH_USER_AUTH="$tmp/user_auth_pw" SSH_ORIGINAL_COMMAND=true
+_assert_contains "key: a non-key login logs an unknown key" "key=unknown: true" "$log"
+exec_run SSH_USER_AUTH="$tmp/missing" SSH_ORIGINAL_COMMAND=true
+_assert_exit "key: a missing auth file does not block the request" 0 "$out_status"
+
+exec_run SSH_CLIENT= SSH_ORIGINAL_COMMAND=true
+_assert_exit "source: works without SSH_CLIENT" 0 "$out_status"
+_assert_contains "source: logs a local request" "run from=local key=unknown: true" "$log"
+
+: >"$audit"
+missing_status=0
+printf 'echo never\n' | env -u SSH_CLIENT PATH="$tmp/fakebin:$PATH" \
+  TMPDIR="$tmp/missing" "$wrapper" >/dev/null 2>&1 || missing_status=$?
+_assert_exit "spool: fails cleanly when it cannot spool" 70 "$missing_status"
+_assert_contains "spool: logs the failure" "cannot create script spool" "$(<"$audit")"
+
+# A request that cannot be logged must not run.
+cat >"$tmp/fakebin/logger" <<'LOGGER'
+#!/usr/bin/env bash
+exit 1
+LOGGER
+marker="$tmp/ran"
+nolog_status=0
+nolog_out=$(env PATH="$tmp/fakebin:$PATH" TMPDIR="$tmp/spool" \
+  SSH_ORIGINAL_COMMAND="touch '$marker'" "$wrapper" 2>&1) || nolog_status=$?
+_assert_exit "audit: refuses a command it cannot log" 70 "$nolog_status"
+_assert_contains "audit: says why it refused" "cannot write the audit log" "$nolog_out"
+if [[ -e "$marker" ]]; then
+  _fail "audit: the unlogged command did not run"
+else
+  _pass "audit: the unlogged command did not run"
+fi
+nolog_status=0
+printf 'touch %q\n' "$marker" | env PATH="$tmp/fakebin:$PATH" TMPDIR="$tmp/spool" \
+  "$wrapper" >/dev/null 2>&1 || nolog_status=$?
+_assert_exit "audit: refuses a script it cannot log" 70 "$nolog_status"
+if [[ -e "$marker" ]]; then
+  _fail "audit: the unlogged script did not run"
+else
+  _pass "audit: the unlogged script did not run"
+fi
+
+_test_summary

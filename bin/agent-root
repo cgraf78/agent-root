@@ -1,0 +1,328 @@
+#!/usr/bin/env bash
+# agent-root - run commands as root on enrolled hosts through a restricted SSH
+# key, without sudo or an open root terminal.
+set -uo pipefail
+
+_agent_root_parent() {
+  case "$1" in
+    */*) printf '%s\n' "${1%/*}" ;;
+    *) printf '.\n' ;;
+  esac
+}
+
+_agent_root_dir() {
+  local path="$1" dir target
+
+  # shdeps exposes bin/agent-root through ~/.local/bin. Follow each portable
+  # readlink hop so the target-side files embedded by enroll come from the same
+  # provider checkout as this launcher, never from PATH.
+  case "$path" in
+    */*) ;;
+    *) path=$(command -v "$path") || return 1 ;;
+  esac
+  while [[ -L "$path" ]]; do
+    dir=$(cd -P -- "$(_agent_root_parent "$path")" && pwd) || return 1
+    target=$(readlink "$path") || return 1
+    [[ "$target" == /* ]] || target="$dir/$target"
+    path="$target"
+  done
+  cd -P -- "$(_agent_root_parent "$path")" && pwd
+}
+
+BIN_DIR=$(_agent_root_dir "${BASH_SOURCE[0]}") || {
+  printf 'agent-root: cannot resolve its installation directory\n' >&2
+  exit 1
+}
+LIB_DIR=$(cd "$BIN_DIR/../lib/agent-root" >/dev/null 2>&1 && pwd -P) || {
+  printf 'agent-root: private library is not installed\n' >&2
+  exit 1
+}
+
+usage() {
+  cat <<'EOF'
+Usage: agent-root run HOST [--] COMMAND [ARG...]
+       agent-root run HOST < SCRIPT
+       agent-root check HOST
+       agent-root list
+       agent-root keygen HOST
+       agent-root enroll HOST > enroll.sh
+       agent-root revoke HOST > revoke.sh
+
+Run commands as root on HOST through its restricted agent-root key. Every
+request is logged on HOST (journalctl -t agent-root).
+
+  run      Run COMMAND as root, or a script read from standard input.
+  check    Confirm that HOST accepts the key and runs commands as root.
+  list     Show configured hosts and whether each has a key.
+  keygen   Create HOST's key pair under the config directory.
+  enroll   Print a root script that installs HOST's key, logging wrapper,
+           and sshd drop-in. Review it, then run it as root on HOST.
+  revoke   Print a root script that removes HOST's key (and the wrapper and
+           drop-in with the last key). It can run through agent-root itself:
+           agent-root revoke HOST | agent-root run HOST
+
+Hosts are configured in $XDG_CONFIG_HOME/agent-root/hosts.d/HOST.conf
+(default ~/.config/agent-root). Override with AGENT_ROOT_CONFIG_DIR.
+EOF
+}
+
+die() {
+  printf 'agent-root: %s\n' "$1" >&2
+  exit 1
+}
+
+usage_error() {
+  printf 'agent-root: %s\n' "$1" >&2
+  printf "Run 'agent-root --help' for usage.\n" >&2
+  exit 64
+}
+
+config_dir() {
+  if [[ -n "${AGENT_ROOT_CONFIG_DIR:-}" ]]; then
+    printf '%s\n' "$AGENT_ROOT_CONFIG_DIR"
+  elif [[ "${XDG_CONFIG_HOME:-}" == /* ]]; then
+    printf '%s/agent-root\n' "$XDG_CONFIG_HOME"
+  else
+    printf '%s/.config/agent-root\n' "$HOME"
+  fi
+}
+
+# Host names become file names and key comments, so keep them to a narrow,
+# path-free grammar.
+check_name() {
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
+    usage_error "invalid host name: '$1'"
+}
+
+# Host files are data, not shell: parse KEY=VALUE lines strictly instead of
+# sourcing them, and reject anything unknown so a typo cannot be ignored.
+load_host() {
+  local name="$1" file key value line n=0
+
+  check_name "$name"
+  file="$CONFIG_DIR/hosts.d/$name.conf"
+  [[ -f "$file" ]] || die "no host config: $file"
+  cfg_host='' cfg_port='' cfg_from=''
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    n=$((n + 1))
+    [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
+    [[ "$line" == *=* ]] || die "$file:$n: expected KEY=VALUE"
+    key=${line%%=*}
+    value=${line#*=}
+    case "$key" in
+      host)
+        # No leading dash, so the value can never be read as an ssh option.
+        [[ "$value" =~ ^[A-Za-z0-9._:][A-Za-z0-9._:-]*$ ]] ||
+          die "$file:$n: invalid host: '$value'"
+        cfg_host=$value
+        ;;
+      port)
+        # No leading zero: Bash arithmetic would read 08 as invalid octal.
+        if [[ ! "$value" =~ ^[1-9][0-9]{0,4}$ ]] || ((value > 65535)); then
+          die "$file:$n: invalid port: '$value'"
+        fi
+        cfg_port=$value
+        ;;
+      from)
+        [[ "$value" =~ ^[0-9A-Fa-f.:/*?]+(,[0-9A-Fa-f.:/*?]+)*$ ]] ||
+          die "$file:$n: invalid from list: '$value'"
+        cfg_from=$value
+        ;;
+      *) die "$file:$n: unknown key: '$key'" ;;
+    esac
+  done <"$file"
+  [[ -n "$cfg_host" ]] || die "$file: missing host="
+  [[ -n "$cfg_from" ]] || die "$file: missing from="
+  key_file="$CONFIG_DIR/keys/$name"
+}
+
+require_key() {
+  [[ -f "$key_file" ]] || die "no key for $1; create it with: agent-root keygen $1"
+}
+
+# Pin the connection to this host's key and nothing else: no agent keys, no
+# shared multiplexed session, no forwards or remote command from the user's
+# ssh_config, and a known_hosts file of its own (pre-seeded from enroll's
+# output, or trusted on first use). The rest of ssh_config (such as ProxyJump)
+# still applies, so remote hosts work the way plain ssh does.
+ssh_args() {
+  local name="$1"
+
+  SSH_ARGS=(
+    -T
+    -o BatchMode=yes
+    -o IdentitiesOnly=yes
+    -o "IdentityFile=$key_file"
+    -o IdentityAgent=none
+    -o ControlMaster=no
+    -o ControlPath=none
+    -o ClearAllForwardings=yes
+    -o RemoteCommand=none
+    -o "HostKeyAlias=agent-root-$name"
+    -o "UserKnownHostsFile=$CONFIG_DIR/known_hosts"
+    -o GlobalKnownHostsFile=/dev/null
+    -o StrictHostKeyChecking=accept-new
+    # Keep ssh's own notices (such as "Permanently added ... to known hosts")
+    # out of command output; real errors still print.
+    -o LogLevel=ERROR
+    -o "ConnectTimeout=${AGENT_ROOT_CONNECT_TIMEOUT:-10}"
+    # AGENT_ROOT_SSH_USER exists for the test suite's unprivileged sshd.
+    -l "${AGENT_ROOT_SSH_USER:-root}"
+  )
+  if [[ -n "$cfg_port" ]]; then
+    SSH_ARGS+=(-p "$cfg_port")
+  fi
+  SSH_ARGS+=("$cfg_host")
+}
+
+cmd_run() {
+  local name remote
+
+  (($# >= 1)) || usage_error "run needs a host"
+  name=$1
+  shift
+  [[ "${1:-}" != -- ]] || shift
+  load_host "$name"
+  require_key "$name"
+  ssh_args "$name"
+  if (($# == 0)); then
+    # A script on standard input runs through bash on the target. Refuse a
+    # terminal so a forgotten command does not wait for typed input.
+    [[ ! -t 0 ]] || usage_error "give a command, or a script on standard input"
+    exec ssh "${SSH_ARGS[@]}"
+  fi
+  # ssh joins its arguments into one string for the remote shell. Quote each
+  # one so the target sees exactly the words given here.
+  remote=$(printf '%q ' "$@")
+  # The target closes a command's standard input (only scripts are logged in
+  # full), so never send it; -n also keeps ssh off a terminal.
+  exec ssh -n "${SSH_ARGS[@]}" -- "${remote% }"
+}
+
+cmd_check() {
+  local name out status
+
+  (($# == 1)) || usage_error "check needs exactly one host"
+  name=$1
+  load_host "$name"
+  require_key "$name"
+  ssh_args "$name"
+  out=$(ssh "${SSH_ARGS[@]}" -- id -u 2>&1)
+  status=$?
+  if ((status == 0)) && [[ "$out" == 0 ]]; then
+    printf 'agent-root: %s ok: commands run as root\n' "$name"
+    return 0
+  fi
+  printf 'agent-root: %s failed (status %s): %s\n' "$name" "$status" "$out" >&2
+  return 1
+}
+
+cmd_list() {
+  local file name key
+
+  (($# == 0)) || usage_error "list takes no arguments"
+  for file in "$CONFIG_DIR"/hosts.d/*.conf; do
+    [[ -e "$file" ]] || continue
+    name=${file##*/}
+    name=${name%.conf}
+    (
+      load_host "$name"
+      key=missing
+      [[ -f "$key_file" ]] && key=present
+      printf '%s\thost=%s%s\tfrom=%s\tkey=%s\n' "$name" "$cfg_host" \
+        "${cfg_port:+:$cfg_port}" "$cfg_from" "$key"
+    )
+  done
+}
+
+cmd_keygen() {
+  local name client
+
+  (($# == 1)) || usage_error "keygen needs exactly one host"
+  name=$1
+  load_host "$name"
+  [[ ! -e "$key_file" && ! -e "$key_file.pub" ]] ||
+    die "a key for $name already exists: $key_file"
+  command -v ssh-keygen >/dev/null 2>&1 || die "ssh-keygen is not installed"
+  mkdir -p -- "$CONFIG_DIR/keys" || die "cannot create $CONFIG_DIR/keys"
+  chmod 0700 "$CONFIG_DIR/keys" || die "cannot secure $CONFIG_DIR/keys"
+  client=$(uname -n)
+  client=${client%%.*}
+  # The comment names the target and the client so a root authorized_keys
+  # entry says which machine's key it is.
+  (umask 077 && ssh-keygen -q -t ed25519 -N '' \
+    -C "agent-root:$name@$client" -f "$key_file") ||
+    die "ssh-keygen failed"
+  printf 'agent-root: created %s; next: agent-root enroll %s\n' "$key_file" "$name"
+}
+
+# Read and validate the public key that the target script will trust.
+read_pubkey() {
+  local pub="$key_file.pub" line
+
+  [[ -f "$pub" ]] || die "no public key: $pub; create it with: agent-root keygen $1"
+  IFS= read -r line <"$pub" || [[ -n "$line" ]] || die "empty public key: $pub"
+  [[ "$line" =~ ^ssh-ed25519\ [A-Za-z0-9+/]+=*(\ [A-Za-z0-9@._:+-]+)?$ ]] ||
+    die "unexpected public key format in $pub"
+  printf '%s\n' "$line"
+}
+
+# Embed a file as a quoted heredoc so its bytes reach the target unchanged.
+emit_heredoc_function() {
+  local func="$1" file="$2" delim="AGENT_ROOT_${1#_}_EOF"
+
+  grep -qx "$delim" "$file" && die "cannot embed $file: it contains $delim"
+  printf '%s() {\n  cat <<'\''%s'\''\n' "$func" "$delim"
+  cat -- "$file"
+  printf '%s\n}\n\n' "$delim"
+}
+
+# Emit a self-contained root script: values for this host, the embedded files,
+# the shared target helpers, and the action. The target needs only bash.
+emit_target_script() {
+  local action="$1" name="$2" pubkey sshd_conf
+
+  pubkey=$(read_pubkey "$name") || exit 1
+  printf '#!/usr/bin/env bash\n'
+  printf '# Generated by agent-root %s for host %s.\n' "$action" "$name"
+  printf '# Review it, then run it as root on that host.\n\n'
+  printf 'host_name=%q\npubkey=%q\nfrom_addrs=%q\n\n' "$name" "$pubkey" "$cfg_from"
+  if [[ "$action" == enroll ]]; then
+    emit_heredoc_function _exec_source "$LIB_DIR/agent-root-exec"
+    sshd_conf=$(mktemp "${TMPDIR:-/tmp}/agent-root-sshd.XXXXXXXX") || die "mktemp failed"
+    sed "s|@FROM@|$cfg_from|" "$LIB_DIR/sshd-match.conf.in" >"$sshd_conf"
+    emit_heredoc_function _sshd_source "$sshd_conf"
+    rm -f -- "$sshd_conf"
+  fi
+  cat -- "$LIB_DIR/common.sh"
+  printf '\n'
+  cat -- "$LIB_DIR/$action.sh"
+}
+
+cmd_enroll() {
+  (($# == 1)) || usage_error "enroll needs exactly one host"
+  load_host "$1"
+  [[ "$cfg_from" =~ (^|,)[0-9A-Fa-f.:]+(,|$) ]] ||
+    die "from= needs at least one literal address so enroll can verify sshd's settings"
+  emit_target_script enroll "$1"
+}
+
+cmd_revoke() {
+  (($# == 1)) || usage_error "revoke needs exactly one host"
+  load_host "$1"
+  emit_target_script revoke "$1"
+}
+
+CONFIG_DIR=$(config_dir)
+
+case "${1:-}" in
+  run) shift && cmd_run "$@" ;;
+  check) shift && cmd_check "$@" ;;
+  list) shift && cmd_list "$@" ;;
+  keygen) shift && cmd_keygen "$@" ;;
+  enroll) shift && cmd_enroll "$@" ;;
+  revoke) shift && cmd_revoke "$@" ;;
+  -h | --help | help) usage ;;
+  '') usage_error "missing command" ;;
+  *) usage_error "unknown command: '$1'" ;;
+esac

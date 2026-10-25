@@ -1,0 +1,17 @@
+# type<TAB>repository-relative path
+# `fixture` records are discovered but intentionally excluded from ShellCheck.
+program	bin/agent-root
+program	install.sh
+program	lib/agent-root/agent-root-exec
+program	lib/agent-root/common.sh
+program	lib/agent-root/enroll.sh
+program	lib/agent-root/revoke.sh
+program	scripts/checkout-installer.conf
+program	support/install-checkout.sh
+program	test/run
+program	test/lib/test.sh
+program	test/install-test
+program	test/agent-root-client-test
+program	test/agent-root-exec-test
+program	test/agent-root-target-test
+program	test/agent-root-sshd-test
